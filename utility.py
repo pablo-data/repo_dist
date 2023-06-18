@@ -3,9 +3,16 @@
 import pandas as pd
 import numpy  as np
 
+#gets Index for n-th Frame
+def get_Idx_n(n,l):
+    
+    Idx = (n*l , (n*l) +l)
+    
+    return(Idx) #tuple de indices
 
 # Configuration of the DAEs
-def load_cnf_dae(ruta_archivo='cnf_dae.csv'):    
+def load_cnf_dae(ruta_ae='cnf_dae.csv', ruta_soft='cnf_softmax.csv'):
+
     # Línea 1: Número de Clases : 5
     # Línea 2: Número de Frame : 100
     # Línea 3: Tamaño de Frame : 1024
@@ -17,13 +24,58 @@ def load_cnf_dae(ruta_archivo='cnf_dae.csv'):
     # Línea 9: Nodos Encoder1. : 192
     # Línea 10: Nodos Encoder2. : 128
     # Línea 11: Nodos Encoder3. : 64
+
+    # softmax 
+
+    # Línea 1: Max. Iteraciones : 300
+    # Línea 2: Tasa Aprendizaje : 0.01
+    # Línea 3: Tamaño miniBatch : 32
+
+    with open(ruta_ae, 'r') as archivo_csv:
+
+        p_sae = [int(i) if '.' not in i else float(i)
+                for i in archivo_csv if i != '\n']
+
+    with open(ruta_soft, 'r') as archivo_csv:
+
+        p_sft = [int(i) if '.' not in i else float(i)
+                for i in archivo_csv if i != '\n']
+
+    return p_sae, p_sft
+
+
+# Initialize weights for SNN-SGDM
+def iniWs(x_shape, Param_):
+
+    inshape  = x_shape
+    outshape = Param_[0]
     
-    with open(ruta_archivo, 'r') as archivo_csv:
+    W = []
+    W_dec = []
+    
+    W.append(iniW(outshape, inshape))
+    W_dec.append(iniW(inshape, outshape))
+    for i in range(1,len(Param_)):
+        
+        inshape  = Param_[i-1]
+        outshape = Param_[i]
+        
+        W.append(iniW(outshape, inshape))
+        W_dec.append(iniW(inshape, outshape))
+        
 
-        conf = [int(i) if '.' not in i else float(i)
-              for i in archivo_csv if i != '\n']
+    W_dec.reverse()
+    W.extend(W_dec)
+    
+    V = []
+    S = []
+    for i in range(len(W)):
+        V.append(np.zeros(W[i].shape))
+        S.append(np.zeros(W[i].shape))
 
-    return conf
+    return W, V, S
+
+
 # Initialize one-wieght    
 def iniW(next,prev):
     r = np.sqrt(6/(next+ prev))
@@ -34,10 +86,10 @@ def iniW(next,prev):
 # STEP 1: Feed-forward of AE
 def dae_forward(X, W, Param):
     # cambiar activaciones por config
-    act_encoder = Param[1]
+    act_encoder = Param[4]
 
-    A = []
-    z = []
+    A   = []
+    z   = []
     Act = []
 
     # data input
@@ -46,12 +98,11 @@ def dae_forward(X, W, Param):
     
     # iter por la cantidad de pesos
     for i in range(len(W)):
-        # print(W[i].shape, X.shape)
+        
         X = np.dot(W[i], X)
         z.append(X)
-        if i == 0:
-            X = act_function(X, act=act_encoder)
-
+        
+        X = act_function(X, act=act_encoder)
         A.append(X)
 
     Act.append(A)
@@ -59,13 +110,10 @@ def dae_forward(X, W, Param):
     
     return Act
 
-
 # Activation function
 def act_function(x, act=1, a_ELU=1, a_SELU=1.6732, lambd=1.0507):
     
     
-    
-
     # Relu
 
     if act == 1:
@@ -132,20 +180,22 @@ def deriva_act(x, act=1, a_ELU=1, a_SELU=1.6732, lambd=1.0507):
 
     return x
 
-
 # STEP 2: Feed-Backward for DAE
-def gradW(Act, ye, W, Param):   
+def gradW(Act, W, Param):
+    
     L = len(Act[0])-1
-    gW = []
-     
-    M = ye.shape[1]
-    Cost = np.sum(np.sum(np.square(Act[0][L] - ye), axis=0)/2)/M
+    
+    act_encoder = Param[4]
+    M = Param[6]
+    e = Act[0][L] - Act[0][0]
+    Cost = np.sum(np.sum(np.square(e), axis=0)/2)/M
     
     # grad salida
-    delta = np.multiply(Act[0][L] - ye, deriva_act(Act[1][L], act=5))
+    delta = np.multiply(e, deriva_act(Act[1][L], act=act_encoder))
      
     gW_l = np.dot(delta, Act[0][L-1].T)
-     
+    
+    gW = [] 
     gW.append(gW_l)
      
     # grad capas ocultas
@@ -154,7 +204,7 @@ def gradW(Act, ye, W, Param):
         
         t1 = np.dot(W[l].T, delta)
          
-        t2 = deriva_act(Act[1][l], act=Param[6])
+        t2 = deriva_act(Act[1][l], act=act_encoder)
          
         delta = np.multiply(t1, t2)
          
@@ -168,16 +218,16 @@ def gradW(Act, ye, W, Param):
     return gW, Cost       
 
 # Update DAE's weight via mAdam
-def updW_madam(W, V, S, gW, t, Param, b1 = 0.9 , b2 = 0.999, e = 10**-6):
-    
-    u = Param[7]
+def updW_madam(W, V, S, gW, t, u, b1=0.9, b2=0.999, e=1e-6):
     for i in range(len(W)):
-        V[i] = b1 * V[i] + (1-b1)(gW[i])
-        S[i] = b2 * S[i] + (1-b2)(gW[i])**2
-        gAdam = (np.sqrt(b2**t)/(1-b1**t)) *  ((V[i]) / (np.sqrt(S[i]+e)))
-        W[i] = W[i] - u * gAdam
+        V[i] = (b1 * V[i]) + ((1 - b1) * gW[i])
+        S[i] = (b2 * S[i]) + ((1 - b2) * (gW[i] ** 2))
+        V_hat = V[i] / (1 - b1 ** t)
+        S_hat = S[i] / (1 - b2 ** t)
+        W[i] = W[i] - (u * V_hat) / (np.sqrt(S_hat) + e)
     
-    return W, V
+    return W, V, S
+
 # Update Softmax's weight via mAdam
 def updW_sft_madam(w,v,gw,mu):
     ...    
@@ -191,7 +241,7 @@ def gradW_softmax(x,y,a):
     
     gW     = -(np.dot(y-a,x.T))/M  #cambios aca
     
-    return(gW,Cost)
+    return gW,Cost
 
 # Calculate Softmax
 def softmax(z):
@@ -201,8 +251,8 @@ def softmax(z):
 
 # save weights DL and costo of Softmax
 def save_w_dl(W,Ws,Cost):    
-    np.savez('wAEs.npz', W[0], W[1])
-    np.savez('wSoftmax.npz', Ws)
+    np.savez('wdae.npz', *W)
+    np.savez('wSoftmax.npz', *Ws)
     
     
     df = pd.DataFrame( Cost )
